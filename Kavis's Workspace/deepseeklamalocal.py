@@ -1,34 +1,49 @@
-from transformers import pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 
-pipe = pipeline(
-    "text-generation",
-    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    torch_dtype="auto",
-    device_map="auto"
+# ── Setup ─────────────────────────────────────────────────────────
+model_id    = "microsoft/phi-3-mini-4k-instruct"
+device      = "cuda" if torch.cuda.is_available() else "cpu"
+torch_dtype = torch.float16 if device == "cuda" else torch.float32
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = (AutoModelForCausalLM
+         .from_pretrained(model_id,
+                          torch_dtype=torch_dtype,
+                          device_map="auto")
+         .eval())
+
+messy_text = """
+okay so like yesterday i was walking down the street and I seen this dog who was like barking so loud that i think my ears was gonna explode or maybe fall off who knows but anyway i keep walking and then this guy come up to me and he say hey do you know where the mall is at and I’m like bro why you asking me i don’t even look like i’m from here because like i just moved here like three days ago...
+"""
+
+stop_token = "###END"              # something the rewrite will never contain
+
+prompt = (
+    "Rewrite the following text to make it clearer, polished, and formal. "
+    "Output **only** the rewritten passage, then write '" + stop_token + "'.\n\n"
+    + messy_text + "\n"
 )
 
-# Updated system message
-messages = [
-    {
-        "role": "system",
-        "content": "make the language for this better."
-    },
-    {
-        "role": "user",
-        "content": (
-            "so like yesterday i was tryna go to the mall but like i aint got no ride and my friend "
-            "was supposed to pick me up but like he was late as always and then when we finally got there "
-            "and we didnt have no umbrella so we got all wet and cold but whatever cuz it was kinda funny honestly "
-            "and then when i got home my mom was like why you so wet and i was like dont worry bout it it was just rain lol"
-        ),
-    },
-]
+# ── Tokenise ──────────────────────────────────────────────────────
+inputs      = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(device)
+prompt_len  = inputs.input_ids.shape[-1]
 
-# Apply chat template
-prompt = pipe.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+# ── Generate ──────────────────────────────────────────────────────
+with torch.no_grad():
+    out_ids = model.generate(
+        **inputs,
+        max_new_tokens=300,
+        temperature=0.1,        # very conservative
+        top_p=0.9,
+        do_sample=True,
+        use_cache=True,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )[0]
 
-# Generate output
-outputs = pipe(prompt, max_new_tokens=512, do_sample=True, temperature=0.1, top_k=50, top_p=0.95)
+# ── Extract rewritten passage only ───────────────────────────────
+text = tokenizer.decode(out_ids[prompt_len:], skip_special_tokens=True)
+clean = text.split(stop_token)[0].strip()
 
-# Print the clean rewritten text
-print(outputs[0]["generated_text"])
+print(clean)
