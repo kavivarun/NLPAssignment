@@ -12,10 +12,12 @@ from typing import Dict, Any, Optional, Tuple
 # Dictionary to store loaded models (only load when needed)
 grammar_pipes = {}
 style_pipes = {}
+coedit_objs = {}  
 
 # Fixed model choices
 GRAMMAR_MODEL = "facebook/bart-base"
 STYLE_MODEL = "rajistics/informal_formal_style_transfer"
+COEDIT_MODEL  = "grammarly/coedit-large"  
 
 # Device selection - use GPU if available, otherwise CPU
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -27,6 +29,69 @@ if torch.cuda.is_available():
 
 BATCH_SIZE = 1 
 MAX_LENGTH = 512
+
+def load_coedit_if_needed(model_name: str = COEDIT_MODEL):
+    """Lazy-load Grammarly CoEdit (tokenizer, model) on the selected device."""
+    from transformers import AutoTokenizer, T5ForConditionalGeneration
+
+    if model_name in coedit_objs:
+        return coedit_objs[model_name]
+
+    print(f"Loading CoEdit model: {model_name} on {DEVICE}")
+    tok   = AutoTokenizer.from_pretrained(model_name)
+    mdl   = T5ForConditionalGeneration.from_pretrained(model_name).to(DEVICE)
+    coedit_objs[model_name] = (tok, mdl)
+    return tok, mdl
+
+def coedit_paraphrase(text: str, max_tokens: int = 512) -> str:
+    """
+    Paraphrase / improve long text with Grammarly CoEdit.
+    Splits into sentence chunks that fit the model context window.
+    """
+    import nltk
+    from nltk.tokenize import sent_tokenize
+    try:                # make sure punkt is available
+        nltk.data.find("tokenizers/punkt")
+    except LookupError:
+        nltk.download("punkt", quiet=True)
+
+    tok, mdl = load_coedit_if_needed()
+    sentences = sent_tokenize(text)
+
+    chunks, current = [], ""
+    for sent in sentences:
+        n_tokens = tok(current + " " + sent, return_tensors="pt").input_ids.shape[1]
+        if n_tokens < max_tokens:
+            current += " " + sent
+        else:
+            chunks.append(current.strip())
+            current = sent
+    if current:
+        chunks.append(current.strip())
+
+    improved = []
+    for chunk in chunks:
+        prompt  = f"Paraphrase and improve the clarity, style, and grammar of the following text: {chunk}"
+        inputs  = tok(prompt, return_tensors="pt", truncation=True, max_length=max_tokens).to(DEVICE)
+        with torch.no_grad():
+            outs = mdl.generate(
+                inputs.input_ids,
+                max_length=max_tokens,
+                do_sample=True,
+                top_p=0.9,
+                temperature=0.7,
+            )
+        improved.append(tok.decode(outs[0], skip_special_tokens=True))
+
+    return " ".join(improved).strip()
+
+def run_coedit_model_async(input_text: str) -> Tuple[str, Optional[str]]:
+    """Thread wrapper for CoEdit paraphraser."""
+    try:
+        result = coedit_paraphrase(input_text)
+        return result, None
+    except Exception as e:
+        return None, str(e)
 
 def load_model_if_needed(model_name, is_grammar=True):
     """Lazy loading of models only when needed with GPU support"""
@@ -129,66 +194,116 @@ def run_pipe_with_prefix(
 
     return outputs_all
 
-def evaluate_text_quality(original_text, processed_text):
+def evaluate_text_quality(original_text: str, processed_text: str):
     """
-    Evaluate the quality of processed text compared to original
-    Returns metrics dictionary
+    Compare processed_text to original_text and return a metrics dict.
+    1) Cleans and splits overly long runs.
+    2) Chunks into sentences and computes per-sentence readability.
+    3) Averages the FKGL and FRE across sentences.
+    4) Falls back to counts-only if textstat is missing or no sentences found.
     """
+    # ---------- helpers ----------
+    _BULLET          = re.compile(r'[\u2022\u2023\u25E6\u2043\u2219]')
+    _TERM            = re.compile(r'([.!?])(\s|$)')
+    _LONG_SENT_SPLIT = re.compile(r'\b(?:and|but|so)\b|,')
+    _SENT_SPLIT      = re.compile(r'[.!?]')
+
+    def _clean(txt: str) -> str:
+        txt = _BULLET.sub('.', txt)
+        txt = txt.replace('\n', '. ')
+        txt = _TERM.sub(r'\1 ', txt)
+        txt = re.sub(r'\.{2,}', '.', txt)
+        txt = re.sub(r'\s{2,}', ' ', txt)
+        return txt.strip()
+
+    def _split_long_runs(txt: str, max_len: int = 40) -> str:
+        words = txt.split()
+        if len(words) <= max_len:
+            return txt
+        out, chunk = [], []
+        for w in words:
+            chunk.append(w)
+            if len(chunk) >= max_len and _LONG_SENT_SPLIT.search(w):
+                out.append(' '.join(chunk) + '.')
+                chunk = []
+        out.append(' '.join(chunk))
+        return ' '.join(out)
+
+    def _prep(txt: str) -> str:
+        return _clean(_split_long_runs(txt))
+
+    def _basic_counts(txt: str):
+        words = txt.split()
+        sentences = [s for s in _SENT_SPLIT.split(txt) if s.strip()]
+        return len(words), len(sentences)
+
+    def _sentence_list(txt: str):
+        # split into sentences, strip out empties
+        return [s.strip() for s in _SENT_SPLIT.split(txt) if s.strip()]
+
+    # ---------- prepare texts ----------
+    orig = _prep(original_text)
+    proc = _prep(processed_text)
+
+    # ---------- initialize all metrics ----------
+    metrics = {
+        "fkgl_original": None,
+        "fkgl_processed": None,
+        "fkgl_change": None,
+        "fre_original": None,
+        "fre_processed": None,
+        "fre_change": None,
+    }
+
+    # ---------- attempt readability via textstat ----------
     try:
-        # Import evaluation libraries here to avoid loading them at startup
         import textstat
-        
-        # Calculate readability scores
-        fkgl_orig = textstat.flesch_kincaid_grade(original_text)
-        fkgl_proc = textstat.flesch_kincaid_grade(processed_text)
-        fre_orig = textstat.flesch_reading_ease(original_text)
-        fre_proc = textstat.flesch_reading_ease(processed_text)
-        
-        # Calculate word and sentence counts
-        word_count_orig = len(original_text.split())
-        word_count_proc = len(processed_text.split())
-        sentence_count_orig = textstat.sentence_count(original_text)
-        sentence_count_proc = textstat.sentence_count(processed_text)
-        
-        return {
-            "fkgl_original": fkgl_orig,
-            "fkgl_processed": fkgl_proc,
-            "fkgl_change": fkgl_orig - fkgl_proc,
-            "fre_original": fre_orig,
-            "fre_processed": fre_proc,
-            "fre_change": fre_proc - fre_orig,
-            "word_count_original": word_count_orig,
-            "word_count_processed": word_count_proc,
-            "word_count_change": word_count_proc - word_count_orig,
-            "sentence_count_original": sentence_count_orig,
-            "sentence_count_processed": sentence_count_proc,
-            "sentence_count_change": sentence_count_proc - sentence_count_orig
-        }
-    except ImportError:
-        # Calculate basic stats without textstat
-        orig_words = len(original_text.split())
-        proc_words = len(processed_text.split())
-        orig_chars = len(original_text)
-        proc_chars = len(processed_text)
-        
-        # Rough sentence count (not as accurate as textstat)
-        orig_sentences = len([s for s in original_text.split('.') if s.strip()])
-        proc_sentences = len([s for s in processed_text.split('.') if s.strip()])
-        
-        return {
-            "word_count_original": orig_words,
-            "word_count_processed": proc_words,
-            "word_count_change": proc_words - orig_words,
-            "char_count_original": orig_chars,
-            "char_count_processed": proc_chars,
-            "char_count_change": proc_chars - orig_chars,
-            "sentence_count_original": orig_sentences,
-            "sentence_count_processed": proc_sentences,
-            "sentence_count_change": proc_sentences - orig_sentences
-        }
-    except Exception as e:
-        print(f"Error in evaluation: {e}")
-        return None
+
+        orig_sents = _sentence_list(orig)
+        proc_sents = _sentence_list(proc)
+        if not orig_sents or not proc_sents:
+            raise ValueError("No sentences detected after cleaning.")
+
+        # compute per-sentence scores
+        fkgl_o_list = [textstat.flesch_kincaid_grade(s) for s in orig_sents]
+        fkgl_p_list = [textstat.flesch_kincaid_grade(s) for s in proc_sents]
+        fre_o_list  = [textstat.flesch_reading_ease(s)   for s in orig_sents]
+        fre_p_list  = [textstat.flesch_reading_ease(s)   for s in proc_sents]
+
+        # average
+        avg_fkgl_o = sum(fkgl_o_list) / len(fkgl_o_list)
+        avg_fkgl_p = sum(fkgl_p_list) / len(fkgl_p_list)
+        avg_fre_o  = sum(fre_o_list)  / len(fre_o_list)
+        avg_fre_p  = sum(fre_p_list)  / len(fre_p_list)
+
+        metrics.update({
+            "fkgl_original": avg_fkgl_o,
+            "fkgl_processed": avg_fkgl_p,
+            "fkgl_change": avg_fkgl_o - avg_fkgl_p,
+            "fre_original": avg_fre_o,
+            "fre_processed": avg_fre_p,
+            "fre_change": avg_fre_p - avg_fre_o,
+        })
+
+    except Exception:
+        metrics["note"] = (
+            "textstat unavailable or input lacked sentences; "
+            "readability metrics set to None."
+        )
+
+    # ---------- always add counts ----------
+    wo, so = _basic_counts(orig)
+    wp, sp = _basic_counts(proc)
+    metrics.update({
+        "word_count_original": wo,
+        "word_count_processed": wp,
+        "word_count_change": wp - wo,
+        "sentence_count_original": so,
+        "sentence_count_processed": sp,
+        "sentence_count_change": sp - so,
+    })
+
+    return metrics
 
 def display_text_quality_metrics(original_text, processed_text, title="Text Quality Metrics", container=None):
     """
@@ -335,7 +450,7 @@ def run_ollama_models_async(input_text: str) -> Tuple[Dict[str, Any], None]:
     try:
         from Ollama_client import chat_with_models
         base_prompt = f"Please fix grammatical errors in this sentence and improve its style: {input_text}. Add it between `<fixg>` and `</fixg>` tags."
-        data = chat_with_models(base_prompt, ["mistral:7b-instruct", "llama3.1:latest"])
+        data = chat_with_models(base_prompt, ["mistral:latest"])
         return data, None
     except Exception as e:
         return None, str(e)
@@ -354,6 +469,7 @@ def process_text_parallel(input_text: str, progress_callback=None) -> Dict[str, 
     results = {
         "grammar_corrected": None,
         "style_improved": None,
+        "coedit_result":    None,
         "translation": None,
         "ollama_results": None,
         "errors": []
@@ -367,6 +483,9 @@ def process_text_parallel(input_text: str, progress_callback=None) -> Dict[str, 
             # Start grammar correction first
             grammar_future = executor.submit(run_grammar_model_async, input_text)
             futures["grammar"] = grammar_future
+
+            coedit_future = executor.submit(run_coedit_model_async, input_text)
+            futures["coedit"] = coedit_future
             
             # Start translation model (independent of grammar)
             translation_future = executor.submit(run_translation_model_async, input_text)
@@ -393,6 +512,12 @@ def process_text_parallel(input_text: str, progress_callback=None) -> Dict[str, 
                     results["errors"].append(f"Style model error: {style_error}")
                 else:
                     results["style_improved"] = style_result
+
+            coedit_result, coedit_error = coedit_future.result()
+            if coedit_error:
+                results["errors"].append(f"CoEdit model error: {coedit_error}")
+            else:
+                results["coedit_result"] = coedit_result
             
             # Get translation result
             translation_result, translation_error = translation_future.result()

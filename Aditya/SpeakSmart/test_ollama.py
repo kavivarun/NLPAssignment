@@ -40,17 +40,17 @@ bad_text = f"""Yesterday, I go to the store and buyed some apples.
 They was very tasty, but I eated them to fast. Now, I wants to get more, but store is close."""
 base_prompt = f"Please fix grammatical errors in this sentence and improve its style: {bad_text}. Add it between `<fixg>` and `</fixg>` tags."
 
-data = chat_with_models(base_prompt, ["mistral:7b-instruct", "llama3.1:latest"])
+data = chat_with_models(base_prompt, ["mistral:latest", "llama3.1:latest"])
 
 
 
 print(data)
 
 print("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
-print(data['mistral:7b-instruct'])
+print(data['mistral:latest'])
 print("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
 print(data['llama3.1:latest'])
 
 print("--------------------Extracted Text--------------------")
-print(f"Mistral: {extract_from_model_responses(data)['mistral:7b-instruct']}")
+print(f"Mistral: {extract_from_model_responses(data)['mistral:latest']}")
 print(f"Llama3.1: {extract_from_model_responses(data)['llama3.1:latest']}")

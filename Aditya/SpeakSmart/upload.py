@@ -186,6 +186,8 @@ class UploadRecord:
                                     st.session_state.grammar_corrected_text = results["grammar_corrected"]
                                 if results["style_improved"]:
                                     st.session_state.paraphrased_text = results["style_improved"]
+
+                                
                                 
                                 # Display all results
                                 self.display_all_results(
@@ -294,37 +296,37 @@ class UploadRecord:
                 results["translation"], 
                 title="Text Quality Metrics: Translation Model"
             )
-        
+        # ── CoEdit result ────────────────────────────────────────────────
+        if results.get("coedit_result"):
+            st.markdown("---")
+            st.markdown(
+                "<h3 style='color:#4682b4;'>CoEdit Result</h3>",
+                unsafe_allow_html=True
+            )
+            st.markdown(
+                f"""
+                <div style="border:2px solid #4682b4;border-radius:10px;padding:15px;background:#f0f8ff;">
+                    <p style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,'Open Sans','Helvetica Neue',sans-serif;color:#333;">
+                        {results['coedit_result']}
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            utility.display_text_quality_metrics(
+                edited_transcription,
+                results["coedit_result"],
+                title="Text Quality Metrics: CoEdit"
+            )
         # Display Ollama results
         if results["ollama_results"]:
             st.markdown("---")
             # Extract Ollama results
             ollama_extracted = utility.extract_from_model_responses(results["ollama_results"])
             
-            # Display Llama results
-            if ollama_extracted.get('llama3.1:latest'):
-                st.markdown("""<h3 style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,Ubuntu, 
-                    Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;color: #4682b4;
-                    text-shadow:2px 2px 8px #1e90ff,0 0 20px #00b7eb;">Llama Result</h3>""",unsafe_allow_html=True)
-                
-                st.markdown(
-                    f"""
-                    <div style="border: 2px solid #4682b4; border-radius: 10px; padding: 15px; background-color: #f0f8ff;">
-                        <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; color: #333;">
-                            {ollama_extracted['llama3.1:latest']}
-                        </p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-                utility.display_text_quality_metrics(
-                    edited_transcription, 
-                    ollama_extracted['llama3.1:latest'], 
-                    title="Text Quality Metrics: Llama"
-                )
             
             # Display Mistral results
-            if ollama_extracted.get('mistral:7b-instruct'):
+            if ollama_extracted.get('mistral:latest'):
                 st.markdown("""<h3 style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,Ubuntu, 
                     Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;color: #4682b4;
                     text-shadow:2px 2px 8px #1e90ff,0 0 20px #00b7eb;">Mistral Result</h3>""",unsafe_allow_html=True)
@@ -333,7 +335,7 @@ class UploadRecord:
                     f"""
                     <div style="border: 2px solid #4682b4; border-radius: 10px; padding: 15px; background-color: #f0f8ff;">
                         <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; color: #333;">
-                            {ollama_extracted['mistral:7b-instruct']}
+                            {ollama_extracted['mistral:latest']}
                         </p>
                     </div>
                     """,
@@ -341,7 +343,7 @@ class UploadRecord:
                 )
                 utility.display_text_quality_metrics(
                     edited_transcription, 
-                    ollama_extracted['mistral:7b-instruct'], 
+                    ollama_extracted['mistral:latest'], 
                     title="Text Quality Metrics: Mistral"
                 )
 
@@ -388,6 +390,34 @@ class UploadRecord:
 
     def continue_sequential_processing(self, edited_transcription):
         """Continue with remaining models in sequential processing"""
+        # ── CoEdit step ─────────────────────────────────────────────────
+        with st.spinner("✨ Running Grammarly CoEdit..."):
+            coedit_text, coedit_err = utility.run_coedit_model_async(edited_transcription)
+        if coedit_err:
+            st.warning(f"CoEdit error: {coedit_err}")
+        else:
+            st.session_state.coedit_text = coedit_text
+        if st.session_state.get("coedit_text"):
+            st.markdown("---")
+            st.markdown(
+                "<h3 style='color:#4682b4;'>CoEdit Result</h3>",
+                unsafe_allow_html=True
+            )
+            st.markdown(
+                f"""
+                <div style="border:2px solid #4682b4;border-radius:10px;padding:15px;background:#f0f8ff;">
+                    <p style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,'Open Sans','Helvetica Neue',sans-serif;color:#333;">
+                        {st.session_state.coedit_text}
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            utility.display_text_quality_metrics(
+                edited_transcription,
+                st.session_state.coedit_text,
+                title="Text Quality Metrics: CoEdit"
+            )
         st.markdown("---")
         st.markdown("### Processing additional models...")
         
@@ -422,42 +452,18 @@ class UploadRecord:
         
         # Ollama Models
         st.markdown("---")
-        with st.spinner("🤖 Processing with Ollama Models (Llama & Mistral)..."):
+        with st.spinner("🤖 Processing with Ollama Models (Mistral)..."):
             time.sleep(0.5)  # Small delay for visual effect
             
             try:
                 base_prompt = f"Please fix grammatical errors in this sentence and improve its style: {edited_transcription}. Add it between `<fixg>` and `</fixg>` tags."
-                data = chat_with_models(base_prompt, ["mistral:7b-instruct", "llama3.1:latest"])
+                data = chat_with_models(base_prompt, ["mistral:latest"])
                 
-                st.success("✨ Ollama Models Complete!")
+                st.success("✨ Ollama Model Complete!")
                 
                 # Extract and display results
-                llama_response = utility.extract_from_model_responses(data)['llama3.1:latest']
-                mistral_response = utility.extract_from_model_responses(data)['mistral:7b-instruct']
+                mistral_response = utility.extract_from_model_responses(data)['mistral:latest']
                 
-                # Display Llama results
-                st.markdown("""<h3 style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,Ubuntu, 
-                    Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;color: #4682b4;
-                    text-shadow:2px 2px 8px #1e90ff,0 0 20px #00b7eb;">Llama</h3>""",unsafe_allow_html=True)
-                
-                if llama_response:
-                    st.markdown(
-                        f"""
-                        <div style="border: 2px solid #4682b4; border-radius: 10px; padding: 15px; background-color: #f0f8ff;">
-                            <p style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; color: #333;">
-                                {llama_response}
-                            </p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-                    utility.display_text_quality_metrics(
-                        edited_transcription, 
-                        llama_response, 
-                        title="Text Quality Metrics: Llama"
-                    )
-                else:
-                    st.html(f"<h2 style='color: yellow;font-weight: italic'> - </h2>")
 
                 # Display Mistral results
                 st.markdown("""<h3 style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,Ubuntu, 
